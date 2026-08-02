@@ -1,0 +1,56 @@
+Revision history for Perl extension Coro::Multicore.
+
+TODO: idle timeout, like IO::AIO
+TODO: add examples
+
+1.07  Tue Aug  3 16:12:02 CEST 2021
+	- renew event pipe in an atfork handler, for limited fork support.
+	- document the fact that AnyEvent is no longer initialised automatically.
+
+1.06  Tue Dec 17 20:18:39 CET 2019
+	- use separate stack when intiialising AnyEvent, to reduce the burden
+          on callers of perlinterp_release ().
+
+1.05  Mon Dec  9 04:11:44 CET 2019
+	- mostly untested fix to make threaded perls work.
+
+1.04  Tue Dec  3 08:11:28 CET 2019
+	- autoload AnyEvent on demand only, which makes it easier
+          to preload this module before fork'ing, as it no longer
+          initialises AnyEvent when loaded, but only on first
+          release.
+
+1.03 Wed Mar  6 17:37:18 CET 2019
+	- the recursioon check (disabled by default) wrongly triggered
+          when multicore was completely _disabled_, instead of acting
+          like a nop.
+
+1.02 Tue Mar  5 13:31:03 CET 2019
+	- make extra sanity checks configurable.
+        - abort, not croak, when checks fail, as error is in XS code.
+	- improve portability to non-gcc-compatible compilers, where perl falls
+          back to a slow workaround that requires dTHX.
+        - do not start first thread at module load, this is not required and
+          potentially harmful with the current model.
+
+1.01 Tue Aug 14 18:52:05 CEST 2018
+	- attempt to port to strawberry perl, but it has too many broken functions
+          (non-working malloc, overrides setjmp with nonexistant PerlProc_setjmp etc.).
+	- do not require custom config for pthread on win32.
+        - usleep on some bsds does not support a time > 1e6, so use sleep+usleep :/
+
+1.0  Sun Aug 12 23:55:33 CEST 2018
+	- bump to 1.0, works in production for me.
+	- experimental fix for perl configs where JMPENV_JUMP requires THX.
+
+0.03 Thu Jan 18 17:43:14 CET 2018
+	- further USE_SOCKETS_AS_HANDLES fixes (Z59).
+        - vastly improved documentation.
+	- (experimental) catch exceptions and re-throw them.
+
+0.02  Mon Jun 29 22:24:18 CEST 2015
+	- actual first release, so experimental.
+
+0.01  Thu Jun 25 16:04:51 CEST 2015
+	- original version; cloned from AnyEvent::XSThreadPool.
+
