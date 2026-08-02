@@ -268,11 +268,24 @@ sub import {
 
 our $WATCHER;
 
+# A Coro event-loop backend can register how to watch our wakeup pipe, so that
+# the reacquire after a released XS call is serviced by whatever loop is in use
+# - not just AnyEvent. A backend (Coro::EV, Coro::IOAsync, ...) sets
+# $Coro::Multicore::WATCH_FD to a coderef ($fd, $poll_cb) that watches $fd for
+# readability, arranges to call $poll_cb when readable, and returns a
+# watcher/guard to keep alive. When it is unset we fall back to AnyEvent, so
+# existing Coro::AnyEvent setups keep working unchanged.
+our $WATCH_FD;
+
 # called when first thread is started, on first release. can
 # be called manually, but is not currently a public interface.
 sub init {
-   require AnyEvent; # maybe load it unconditionally?
-   $WATCHER ||= AE::io (fd, 0, \&poll);
+   if ($WATCH_FD) {
+      $WATCHER ||= $WATCH_FD->(fd (), \&poll);
+   } else {
+      require AnyEvent; # maybe load it unconditionally?
+      $WATCHER ||= AE::io (fd, 0, \&poll);
+   }
 }
 
 =head1 THREAD SAFETY OF SUPPORTING XS MODULES
