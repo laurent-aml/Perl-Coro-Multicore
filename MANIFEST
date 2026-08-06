@@ -13,6 +13,11 @@ t/01_basic.t
 t/02_atomic.t
 t/03_release_exception.t
 t/04_backend.t
+t/10_offload_ctx.t
+t/11_offload_croak_safety.t
+t/12_offload_cancel.t
+t/13_awaitable.t
+t/14_offload_handle.t
 
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)

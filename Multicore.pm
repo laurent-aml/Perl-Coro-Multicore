@@ -277,6 +277,64 @@ not reach for it expecting to carve a parallel hole out of an atomic region.
 See L</INTERACTION WITH OTHER SOFTWARE> for why, and for what becomes of the
 multicore-enabled calls themselves.
 
+=item $previous = Coro::Multicore::enable_offload [$enable]
+
+Install (C<$enable> true, the default) or remove (false) the I<offload> backend
+for the core C<multicore_offload> hook, returning the previous on/off state.
+Unlike the default release/acquire backend - which migrates the interpreter to a
+worker while the blocking call stays put on the caller's thread - offload keeps
+the interpreter B<pinned> to its thread and runs the module's pure-C C<work> on a
+pool of worker threads. Because the interpreter is never migrated, this works even
+where release/acquire cannot: that one hands the interpreter to another native
+thread, so it needs a perl that is not I<using> ithreads - which on Windows is
+what the C<fork> emulation is built on, so there it wants a non-ithread build.
+Offload does not care either way. The cost is that the XS module hands its C call
+to the hook as a C<work>/C<done> pair.
+
+C<multicore_offload> hands the module back a B<handle> (see
+L</THE OFFLOAD HANDLE>) rather than a value, and this backend returns it while the
+work is still running. What the module does with it decides how the call looks:
+if it waits for the value - which the C<multicore_offload_sync> wrapper in
+F<perlmulticore.h> does for it - the calling L<Coro> thread is suspended for the
+duration and the call looks synchronous, exactly as a blocking one would, while
+other Coro threads run meanwhile. If it returns the handle instead, from an
+asynchronous entry point, the caller decides when to collect it - and may have
+several offloads running from one Coro thread.
+
+B<The whole offload backend is experimental> - not just this method: the
+mechanism, its interaction with the event loop, and its API may all change or be
+removed. It is B<off by default> (the default backend remains release/acquire),
+and, to actually run, needs an active event loop.
+
+It also needs a perl that B<carries the core C<multicore_offload> hook>, which
+today means a patched one: unlike the release/acquire bracket, whose two function
+pointers a module and a backend can pass between themselves through
+C<PL_modglobal> on any perl at all, offload rendezvouses inside the interpreter.
+On a perl without it this method C<die>s, the offload backend is not even compiled
+(see C<_offload_supported>), and everything else in this module works as it always
+has - the release/acquire bracket is unaffected, and it is the default.
+
+=item $found = Coro::Multicore::cancel_offload $coro
+
+Ask an offload issued by C<$coro> and still in flight to stop, returning whether
+one was found.  Advisory: it raises the flag that C<work> polls, and a C<work>
+that does not poll runs to completion regardless.
+
+C<$coro> itself is left alone - it stays suspended in its wait, and when C<work>
+returns early C<done> runs as usual with C<done_ctx.cancelled> set, so the offload
+call returns a partial result rather than raising.  That is what distinguishes this
+from throwing at or cancelling the thread: both of those unwind it, so C<done>
+never runs and there is nothing to collect.
+
+Where the handle is to hand, C<< $handle->cancel >> does the same thing and says
+which offload it means - and blocks until the work has stopped, which this cannot,
+having no way to know which offload it asked about. C<< $handle->safe_cancel >>
+stops one without blocking at all. This function remains the way to reach an
+offload whose handle a module kept to itself.
+
+Only meaningful with the I<offload> backend installed; croaks otherwise, and
+croaks if C<$coro> is not a Coro thread.  See L</CANCELLING WORK IN PROGRESS>.
+
 =item $previous = Coro::Multicore::max_idle [$threads]
 
 Get or set the number of idle worker threads kept warm (default C<1>). The
@@ -344,6 +402,472 @@ sub init {
    }
 }
 
+our $OFFLOAD_ENABLED = 0; # whether the (experimental) offload backend is installed
+
+# Install/remove the offload backend for the core multicore_offload hook,
+# returning the previous on/off state. The whole offload backend is EXPERIMENTAL
+# and off by default (the release/acquire backend is installed in BOOT); this is
+# opt-in and requires a perl with the core hook.
+sub enable_offload {
+   my $on   = @_ ? ($_[0] ? 1 : 0) : 1;
+   my $prev = $OFFLOAD_ENABLED;
+
+   if ($on) {
+      _offload_supported ()
+         or do { require Carp; Carp::croak ("Coro::Multicore: offload backend not available (this perl lacks the core multicore_offload hook)") };
+      init ();             # ensure our wakeup pipe is watched by the event loop
+      _offload_register (1);
+   } else {
+      _offload_register (0) if _offload_supported ();
+   }
+
+   $OFFLOAD_ENABLED = $on;
+   $prev
+}
+
+package Coro::Multicore::Offload::Awaitable;
+
+# The handle multicore_offload () hands back.  The core contract says the backend
+# supplies the object, the offloading module returns it without naming its class,
+# and the caller takes the result out of it - with `await` from a stackless caller,
+# or `get` from a Coro one, which suspends the calling Coro thread until the work
+# is over.  So an offloaded call still looks synchronous where that is what is
+# wanted, while several of them can be in flight from one Coro thread.
+#
+# The protocol is the AWAIT_* method set of Future::AsyncAwait::Awaitable, which is
+# duck-typed: implementing the methods is all that is required, and nothing here
+# depends on Future being installed.
+#
+# The object is a hash created in XS (see Multicore.xs), and the fields shared with
+# that half are `job` (the in-flight job, absent once resolved and on a handle that
+# never had one), `ready`, and `waiters`.  The rest - `values`, `failure`,
+# `cancelled`, `on_ready`, `on_cancel` - is private to this half.
+
+# Constructors.  The protocol needs to be able to make instances of its own
+# accord: AWAIT_CLONE for the future an async sub returns, and the two NEW_ ones
+# for a result that is already known.  None of those has a job, which is the one
+# way an instance from here differs from one the backend handed back - and the
+# reason the class supports a state with no job at all.
+sub new            { bless { ready => 0 }, ref $_[0] || $_[0] }
+sub AWAIT_CLONE    { bless { ready => 0 }, ref $_[0] || $_[0] }
+sub AWAIT_NEW_DONE { my $class = shift; bless { ready => 1, values  => [ @_ ]  }, ref $class || $class }
+sub AWAIT_NEW_FAIL { my $class = shift; bless { ready => 1, failure => $_[0]   }, ref $class || $class }
+
+sub AWAIT_IS_READY     { $_[0]{ready} ? 1 : 0 }
+sub AWAIT_IS_CANCELLED { $_[0]{cancelled} ? 1 : 0 }
+
+# The result, reported as coming from $level frames up: a failure has to be raised
+# at the point that asked for the value, not from inside this file, which is both
+# what the protocol's own test suite checks and what makes the error useful.
+sub _result {
+   my ($self, $level) = @_;
+
+   if (defined (my $failure = $self->{failure})) {
+      die $failure if ref $failure;
+
+      my (undef, $file, $line) = caller $level;
+      $failure .= " at $file line $line.\n" unless $failure =~ /\n\z/;
+
+      die $failure;
+   }
+
+   my $values = $self->{values} || [];
+
+   wantarray ? @$values : $values->[0]
+}
+
+sub AWAIT_GET { $_[0]->_result (1) }
+
+# Wait for the result, running the event loop meanwhile.  Under this backend that
+# means suspending the calling Coro thread - the completion arrives through our
+# wakeup pipe, so a wait that blocked the thread would deadlock instead - and it is
+# where the blocking that multicore_offload () itself used to do now happens.
+sub AWAIT_WAIT {
+   my $self = shift;
+
+   Coro::Multicore::_offload_wait ($self) unless $self->{ready};
+
+   $self->_result (1)
+}
+
+*get = \&AWAIT_WAIT;
+
+sub AWAIT_ON_READY {
+   my ($self, $cb) = @_;
+
+   if ($self->{ready}) {
+      $cb->($self);
+   } else {
+      push @{$self->{on_ready}}, $cb;
+   }
+}
+
+# The protocol's resolvers, which belong to the job-less mode: an instance made by
+# AWAIT_CLONE or one of the AWAIT_NEW_ constructors, which is what Future::AsyncAwait
+# resolves when it builds the future an async sub returns.  Resolving a handle that
+# has a job in flight would let a waiter return while the worker was still writing
+# into the caller's frame, so it is refused rather than trusted not to happen.
+sub AWAIT_DONE {
+   my $self = shift;
+
+   $self->_no_job ("AWAIT_DONE");
+   $self->{values} = [ @_ ];
+   $self->_resolved
+}
+
+sub AWAIT_FAIL {
+   my ($self, $failure) = @_;
+
+   $self->_no_job ("AWAIT_FAIL");
+   $self->{failure} = $failure;
+   $self->_resolved
+}
+
+sub _no_job {
+   my ($self, $what) = @_;
+
+   return unless $self->{job};
+
+   require Carp;
+   Carp::croak ("Coro::Multicore: $what on a handle whose offload is still running");
+}
+
+sub _resolved {
+   my $self = shift;
+
+   $self->{ready} = 1;
+
+   my $waiters  = delete $self->{waiters};
+   my $on_ready = delete $self->{on_ready};
+
+   # a coro that was cancelled while parked leaves a hole behind (see
+   # offload_unpark () in the XS)
+   if ($waiters)  { $_->ready for grep defined, @$waiters }
+   if ($on_ready) { $_->($self) for @$on_ready }
+
+   ()
+}
+
+sub AWAIT_ON_CANCEL    { push @{$_[0]{on_cancel}}, $_[1] }
+sub AWAIT_CHAIN_CANCEL { push @{$_[0]{on_cancel}}, $_[1] }
+
+sub _fire_on_cancel {
+   my $self = shift;
+
+   if (my $on_cancel = delete $self->{on_cancel}) {
+      for my $c (@$on_cancel) {
+         ref $c eq 'CODE' ? $c->($self) : $c->cancel;
+      }
+   }
+}
+
+# Cancellation comes in two kinds, and the difference is what happens to the
+# interpreter while the work is stopping.  Both are advisory in the same way: they
+# raise the flag `work` polls, and a work that does not poll runs to completion
+# regardless.
+#
+#   cancel       PROMPT.  Blocks the interpreter until the work has actually
+#                stopped, then resolves.  When it returns the offload is over,
+#                which is what makes it comparable to a Future's cancel.
+#
+#   safe_cancel  ASYNCHRONOUS.  Raises the flag and hands back an awaitable that
+#                resolves once the work has stopped, so the other Coro threads -
+#                and the event loop - keep running meanwhile.
+#
+# Neither invents a partial result.  What the caller ends up with is whatever the
+# module's done () makes of a truncated run, and a module that knows its result is
+# incomplete raises PerlMulticore::Cancelled rather than returning something that
+# cannot be told apart from a whole answer.  A cancellation that arrived too late to
+# truncate anything is not an error at all.
+sub cancel {
+   my $self = shift;
+
+   return if $self->{ready};
+
+   $self->{cancelled} = 1;
+   $self->_fire_on_cancel;
+
+   # a result held back by a safe_cancel in progress (see _complete): applying it
+   # is what this cancel is for
+   if (my $held = delete $self->{held}) {
+      return $self->_apply ($held);
+   }
+
+   if ($self->{job}) {
+      my $completion = Coro::Multicore::_offload_cancel_wait ($self);
+
+      # the work has stopped by the time that returns; done () still has to run
+      $self->_complete ($completion) if $completion;
+   } else {
+      # PerlMulticore comes with the perl that carries the hook, so a handle made
+      # by hand on a perl without it - which is all a handle can be there - falls
+      # back to a plain string rather than dying in require
+      $self->{failure} ||=
+         eval { require PerlMulticore; PerlMulticore::Cancelled->new }
+         || "offload cancelled";
+
+      $self->_resolved;
+   }
+
+   ()
+}
+
+# The asynchronous companion, from Future::AsyncAwait::Awaitable: begin cancelling
+# and hand back an awaitable that completes when the cleanup - here, the worker
+# actually stopping - is over.  This instance becomes cancelled at that point and
+# not before.
+sub safe_cancel {
+   my $self = shift;
+
+   return $self->AWAIT_NEW_DONE if $self->{ready};
+
+   $self->{cancelled} = 1;
+   $self->_fire_on_cancel;
+
+   my $disposal = $self->AWAIT_CLONE;
+   my @waiting;
+
+   if ($self->{job}) {
+      $self->{safe_cancelling} = 1;
+      $self->{safe_disposal}   = $disposal;
+
+      my $completion = Coro::Multicore::_offload_cancel ($self);
+
+      # Inside an atomic section there is no way to wait for the awaitable this
+      # would hand back - suspending is exactly what such a section forbids - so
+      # the flag half took the prompt path instead and the work has already
+      # stopped.  Resolve here and report the cleanup as finished, so that
+      # awaiting it is a no-op rather than a deadlock.
+      if ($completion > 0) {
+         delete $self->{safe_cancelling};
+         delete $self->{safe_disposal};
+
+         $self->_complete ($completion);
+         $disposal->AWAIT_DONE;
+      }
+
+      return $disposal;
+   }
+
+   # No job of our own, so our cleanup is our children's: this is the shape
+   # Future::AsyncAwait uses, where the future an async sub returns is a clone of
+   # the thing it awaited, and the thing it awaited is chained to it.
+   @waiting = map { $_->safe_cancel } grep { !$_->AWAIT_IS_READY }
+                 @{ delete $self->{safe_children} || [] };
+
+   unless (@waiting) {
+      $self->cancel;
+      $disposal->AWAIT_DONE;
+
+      return $disposal;
+   }
+
+   my $pending = @waiting;
+
+   for my $w (@waiting) {
+      $w->AWAIT_ON_READY (sub {
+         return if --$pending;
+
+         # The ordering the protocol requires: WE become cancelled first, so that a
+         # frame resumed by a child becoming ready sees its own future already
+         # cancelled - and only then are the children finished off.
+         $self->cancel;
+         $_->cancel for @{ $self->{safe_cancelled_children} || [] };
+         $disposal->AWAIT_DONE;
+      });
+   }
+
+   $disposal
+}
+
+# Attaching a child for safe cancellation also tells the child that a parent is
+# orchestrating its teardown, so that it holds its result back until we say (see
+# _complete) rather than resolving as soon as the work stops.
+sub AWAIT_CHAIN_SAFE_CANCEL {
+   my ($self, $child) = @_;
+
+   push @{$self->{safe_children}}, $child;
+   push @{$self->{safe_cancelled_children}}, $child;
+
+   $child->{safe_parent_driven} = 1 if ref $child eq ref $self;
+
+   ()
+}
+
+# Called from the XS when the work is over: run the module's done () inside an eval
+# - the sanctioned way for it to report failure is to croak - and resolve with
+# whichever came back.  This is the only place a job-backed handle is resolved.
+sub _complete {
+   my ($self, $completion) = @_;
+
+   my @values = eval { Coro::Multicore::_offload_run_done ($completion) };
+   my $result = $@ ? { failure => $@ } : { values => \@values };
+
+   # A safe_cancel is in progress and a parent is orchestrating it: hold the result
+   # until the parent has marked itself cancelled and comes back to us (see
+   # safe_cancel).  Without a parent there is nobody to wait for, so resolve now and
+   # report the cleanup as done.
+   if (delete $self->{safe_cancelling}) {
+      my $disposal = delete $self->{safe_disposal};
+
+      $self->{held} = $result if $self->{safe_parent_driven};
+      $self->_apply ($result) unless $self->{safe_parent_driven};
+      $disposal->AWAIT_DONE if $disposal;
+
+      return;
+   }
+
+   $self->_apply ($result)
+}
+
+sub _apply {
+   my ($self, $result) = @_;
+
+   exists $result->{failure}
+      ? $self->AWAIT_FAIL ($result->{failure})
+      : $self->AWAIT_DONE (@{$result->{values}})
+}
+
+# A pending handle that nobody is going to collect: the consumer dropped it, or the
+# Coro thread holding it was cancelled.  The work still owns whatever it was given,
+# so this asks it to stop and waits until it has - see offload_abandon () in the XS.
+#
+# done () still runs, with done_ctx.dropped set and its value discarded: it is the
+# only place a module can release what it built, and a module that returned this
+# handle upward has its job on the heap with nothing else able to free it.  It runs
+# here rather than later because a frame-owned job dies with the frame that is being
+# torn down - and inside an eval, because there is nobody to raise to.
+sub DESTROY {
+   my $self = shift;
+
+   return unless $self->{job};
+
+   my $completion = Coro::Multicore::_offload_abandon ($self)
+      or return;
+
+   eval { Coro::Multicore::_offload_run_done ($completion); 1 }
+      or warn "Coro::Multicore: offload done () failed after the handle was dropped: $@";
+}
+
+package Coro::Multicore;
+
+=head1 THE OFFLOAD HANDLE
+
+None of this section applies unless the perl carries the core
+C<multicore_offload> hook and C<Coro::Multicore::enable_offload> has installed
+this backend; see there for what that requires.
+
+An offloading XS module gets a handle back from C<multicore_offload>, not a
+value, and it is C<Coro::Multicore::Offload::Awaitable> when this backend is
+installed. The class is deliberately not something a caller names: core's
+contract (F<perlmulticore.h>) fixes the B<methods>, every backend supplies its
+own class, and that is what lets an XS module offer one asynchronous entry point
+that works whichever backend the application chose - or none.
+
+Most callers never see it. A module whose method has always returned a value
+still returns one, because the C wrapper C<multicore_offload_sync> waits for the
+handle on its behalf: for this backend that suspends the calling Coro thread until
+the work is over, which is the transparent behaviour the whole module exists to
+provide. The handle only surfaces where a module offers an asynchronous entry
+point as well:
+
+   my $handle = $obj->scramble_async ($buf);   # returns as soon as it is queued
+
+   my $result = $handle->get;                  # suspend this Coro thread for it
+   $handle->cancel;                            # stop it, blocking until it has
+   await $handle->safe_cancel;                 # stop it without blocking
+
+   # or, from a Future::AsyncAwait sub, when that is the backend in use
+   my $result = await $handle;
+
+What it buys under this backend is several offloads in flight from one Coro
+thread, which otherwise needs a thread each:
+
+   my @h = map { $_->scramble_async } @jobs;   # all of them running
+   my @r = map { $_->get } @h;                 # collected in order
+
+=over 4
+
+=item $result = $handle->get
+
+Wait for the work to finish and return what the module's C<done> produced,
+suspending the calling Coro thread meanwhile - the event loop keeps turning, since
+that is how the completion arrives. Returns at once if the handle is already
+resolved, which it may be: an offload issued inside an C<atomic> section, or one
+that found no free job slot, has already run by the time the handle is seen.
+
+If C<done> croaked - a module's sanctioned way of reporting failure - the
+exception is raised here. So is an exception aimed at the waiting Coro thread, but
+only once the work has really stopped: unwinding earlier would free memory the
+worker is still writing into.
+
+Must not be called from an C<atomic> section, which forbids suspending; that
+croaks rather than deadlocking.
+
+=item $handle->cancel
+
+Stop the work and B<block> until it has stopped, so that the offload is over by the
+time this returns. Advisory in the usual way - C<work> stops when it next polls,
+and one that never polls is waited out - so how long it blocks is up to the
+operation. Blocking is what makes this the I<prompt> form, comparable to a
+L<Future>'s C<cancel>: the alternative, returning while the worker is still
+writing, is what C<safe_cancel> is for.
+
+Same mechanism as C<Coro::Multicore::cancel_offload>, but it says which offload it
+means, and it waits.
+
+What the caller ends up with is whatever the module's C<done> makes of a truncated
+run. A module that knows its result is incomplete raises
+C<PerlMulticore::Cancelled> rather than returning something the caller could not
+tell apart from a whole answer; one whose work had finished anyway before noticing
+the flag returns the whole answer, because a late cancellation is not an error.
+
+=item $cleanup = $handle->safe_cancel
+
+The asynchronous companion, from L<Future::AsyncAwait::Awaitable>: raise the same
+flag, but return at once with an awaitable that completes when the work has
+stopped. Nothing is blocked meanwhile - the event loop turns and the other Coro
+threads run - and the handle becomes cancelled when the cleanup completes, not
+before.
+
+   await $handle->safe_cancel;    # or $handle->safe_cancel->get
+
+This is the form a stackless caller needs, since blocking its thread would stop the
+very loop the completion arrives on. C<AWAIT_CHAIN_SAFE_CANCEL> chains another
+awaitable to this one, with the ordering the protocol requires: this instance is
+marked cancelled before its children, so that a frame resumed by a child sees its
+own future already cancelled.
+
+Inside a C<Coro::Atomic> section this behaves as C<cancel> does - it blocks until
+the work has stopped, and the awaitable it returns is already complete. It has to:
+waiting for that awaitable would mean suspending, which is the one thing the
+section forbids, so an asynchronous cancellation there could never be completed.
+The same trade is made everywhere else in this module: atomicity is a correctness
+guarantee, whereas doing the cleanup without blocking is an optimisation.
+
+
+=item AWAIT_IS_READY, AWAIT_GET, AWAIT_WAIT, AWAIT_ON_READY, ...
+
+The C<AWAIT_*> protocol of L<Future::AsyncAwait::Awaitable>, which is duck-typed:
+implementing the methods is the whole requirement, and nothing here needs
+L<Future> installed. It is what makes the handle usable from an C<async sub>, and
+it is verified against that distribution's own conformance suite where it is
+available.
+
+=back
+
+A pending handle that is simply dropped - a caller that decides it wants neither
+the value nor the work, or a Coro thread cancelled while holding one - is how the
+backend learns nobody is waiting. It then asks the work to stop and B<waits> for
+it, because whatever the work was given usually belongs to the frame being torn
+down. How long that takes depends on how promptly C<work> polls.
+
+The module's C<done> still runs on that path, with C<done_ctx.dropped> set and its
+value discarded, because it is the only place the module can release what it built
+- for one that returned the handle upward, its job is on the heap and nothing else
+can reach it. It runs inside an C<eval>, there being nobody to raise to; a failure
+is reported as a warning.
+
 =head1 THREAD SAFETY OF SUPPORTING XS MODULES
 
 Just because an XS module supports perlmulticore might not immediately
@@ -385,36 +909,32 @@ went wrong, if things go wrong.
 =item EXCEPTIONS
 
 When a thread that has currently released the perl interpreter (e.g. because it is
-executing a perlmulticore enabled XS function) receives an exception, it continues
-normally: the XS function is B<not> interrupted, C<perlinterp_acquire ()> returns
-as usual, and the call completes and returns its value.  The exception is not lost -
-it is held pending on that coro thread and delivered by L<Coro> in the ordinary
-way, at that thread's next yield point.
+executing a perlmulticore enabled XS function) receives an exception, the XS
+function is B<not> interrupted: it finishes its blocking work, C<perlinterp_acquire
+()> returns as usual, and the function runs to its end and cleans up.  The
+exception is then raised as the XS function returns, so from perl it reads as
+though the call itself died - an C<eval> around it catches it - while the XS frame
+really did return normally.
 
-This is deliberate.  By the time C<perlinterp_acquire ()> is reached the blocking
-work has already finished, so raising there would not cancel anything; it would
-only discard a result that already exists, and would do so by unwinding out of the
-middle of an XS function that still has cleanup pending - a buffer to free, a
-statement to finalise, a mutex to unlock.  The perlmulticore contract every
-supporting module is written against is C<release (); work (); acquire ();> and
-then I<carry on>, and such modules do not install unwind-safe cleanup around their
-acquire.  Letting the call finish keeps that contract, and the exception then
-unwinds at the perl level where C<eval>, guards and destructors all behave as
-written.
+Both halves of that matter.  Raising inside C<perlinterp_acquire ()> would unwind
+out of the middle of an XS function that still has cleanup pending - a buffer to
+free, a statement to finalise, a mutex to unlock - and the perlmulticore contract
+every supporting module is written against is C<release (); work (); acquire ();>
+and then I<carry on>; such modules install no unwind-safe cleanup around their
+acquire.  But merely leaving the exception pending is not enough either: L<Coro>
+delivers a pending exception only at the end of a Schedule-Like Function, so it
+would wait for the thread's next C<cede> or blocking call - arbitrarily far away,
+and skipped altogether by a thread that returns from the call and then simply
+ends, which used to lose the exception silently.
 
-The cost is that delivery is as late as the thread's next yield.  A thread that
-returns from the call and then finishes without yielding again may not see the
-exception at all.  Making delivery prompt - at the first perl-level boundary after
-the XS function returns, still without unwinding through it - would remove that
-gap while keeping the safety, and is the intended direction; see L</BUGS &
-LIMITATIONS>.
+So the exception is taken over on reacquiring the interpreter and armed to fire at
+the scope exit of the XS function that released it.  That is the first perl-level
+boundary after the call, it always happens, and it costs the XS function nothing.
 
 If what you want is to B<abort> the work rather than to be told about it
-afterwards, note that neither delivery point can do that: once the C code is
-running, release/acquire has no way to interrupt it.  That requires cooperation
-from the module itself, and the I<offload> backend is where it can be expressed -
-its job record is a natural place for a cancellation flag that a chunked C<work>
-can poll.
+afterwards, the release/acquire bracket cannot help: once the C code is running it
+has no way to interrupt it.  The I<offload> backend can, with the module's
+cooperation - see L</CANCELLING WORK IN PROGRESS>.
 
 =item CANCELLATION
 
@@ -430,6 +950,53 @@ Safe cancellation will simply fail in this case, so is still "safe" to
 call.
 
 =back
+
+=head1 CANCELLING WORK IN PROGRESS
+
+Neither backend can stop C code that is already executing - there is no safe way
+to interrupt an arbitrary C function from outside.  So cancellation through the
+I<offload> backend is B<advisory>, and needs the module to take part.
+
+A cancellation flag is handed to C<work> in its context.  A C<work> written in
+chunks polls it and returns early:
+
+   static void
+   my_work (void *arg, const perl_multicore_work_ctx *ctx)
+   {
+     while (more_to_do (arg))
+       {
+         if (ctx && ctx->size >= sizeof (*ctx) && ctx->cancel && *ctx->cancel)
+           break;                     /* asked to stop */
+
+         do_one_chunk (arg);
+       }
+   }
+
+C<done> is told, through C<done_ctx.cancelled>, whether the work stopped early,
+so it can marshal a partial result or none at all.
+
+The flag is raised when the thread that issued the offload is no longer waiting
+for the answer: an exception aimed at it, or its cancellation.  In that case the
+offload call raises rather than returning.
+
+It raises B<after the work has stopped>, though, not the moment the exception
+arrives.  C<work_arg> points into the frame that is being unwound, and so, usually,
+does everything C<work> writes into, which the worker is still busy with; letting
+the frame go first would hand it freed memory.  So the wait asks the work to stop
+and goes on waiting, and only then raises.  Cancelling the thread outright cannot
+wait in the same green-thread sense - there is nothing left to resume - so it
+blocks the interpreter thread instead, for as long as the work takes to notice.
+
+Which means C<work> deciding not to poll is not free: a C<work> that never polls
+cannot be aborted, and an interrupted call then waits out the whole thing.  Poll
+often enough that the wait is short.
+
+Which trigger you want decides how you ask.  Throwing at or cancelling the thread
+unwinds it, so the offload call raises and C<done> never runs: use that when the
+answer is no longer wanted at all - and note that C<work> must then release
+anything it acquired itself, since C<done> is not there to do it.
+C<cancel_offload> leaves the thread suspended, so C<done> does run and the call
+returns whatever C<work> managed: use that when a partial result is worth having.
 
 =head1 INTERACTION WITH OTHER SOFTWARE
 
@@ -517,26 +1084,6 @@ Future versions of this module might do this automatically.
 
 =over 4
 
-=item exception delivery is as late as the next yield
-
-An exception thrown at a coro thread while it has the interpreter released is
-held pending and delivered at that thread's next yield point, rather than at the
-first perl-level boundary after the XS call returns (see L</EXCEPTIONS>).  So
-delivery can be arbitrarily late, and a thread that returns from the call and then
-finishes without yielding again may never see it.
-
-Delivering at the next perl-level boundary instead would close both gaps while
-still letting the XS function return and clean up normally.  That is the intended
-direction; it is not implemented.
-
-=item cancellation cannot abort work already running
-
-Neither backend can interrupt C code that is already executing - see
-L</CANCELLATION> for what unsafe cancellation does instead.  Aborting work needs
-the module's cooperation, and only the I<offload> backend has anywhere to put it:
-a cancellation flag in the job record that a chunked C<work> polls between
-chunks.  Not implemented.
-
 =item (OS-) threads are never released
 
 At the moment, threads that were created once will never be freed. They
@@ -555,6 +1102,15 @@ Future versions will likely lift this limitation.
 The enable_times feature uses the per-thread timer to measure per-thread
 execution time, but since Coro::Multicore runs threads on different
 pthreads it will get the wrong times. Real times are not affected.
+
+=item The offload backend needs a patched perl
+
+The release/acquire bracket - what this module is mostly for - works on any perl,
+because a module and a backend meet in a C<PL_modglobal> struct that needs no
+support from the interpreter. Offload does not: its hook lives in the interpreter,
+so it exists only on a perl built with it. There, C<enable_offload> works; anywhere
+else the offload half of this module is compiled out and C<enable_offload> dies,
+which is a limitation of where the rendezvous was put rather than of the mechanism.
 
 =item Fork support
 

@@ -3,6 +3,19 @@ Revision history for Perl extension Coro::Multicore.
 TODO: add examples
 
 1.0701
+	- EXPERIMENTAL, off by default: an optional "offload" backend for the core
+	  multicore_offload hook (Coro::Multicore::enable_offload).  Where the default
+	  release/acquire backend migrates the interpreter to a worker thread while the
+	  blocking call stays put, offload never migrates it: the interpreter stays
+	  pinned and the module's pure-C work () goes to a pool of worker threads
+	  instead - so it works where release/acquire cannot, notably Windows, and
+	  regardless of whether the perl uses ithreads.  multicore_offload () hands the
+	  module back a handle rather than a value, which is what lets an XS module
+	  offer an ASYNCHRONOUS entry point: the calling Coro thread can hold several
+	  offloads in flight, await one, or wait for one.  A module that would rather
+	  keep returning a value uses the synchronous wrapper, and then nothing about
+	  the call changes.  See THE OFFLOAD HANDLE in the documentation for the
+	  handle, its cancellation and what it promises.
 	- release/acquire is refused, rather than attempted, when Coro's backend cannot
 	  have a parked context resumed by another thread.
 	- release/acquire: an exception aimed at a thread while it has the interpreter
