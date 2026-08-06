@@ -1,5 +1,6 @@
 use ExtUtils::MakeMaker;
 use Coro::MakeMaker;
+use Config;
 
 use Canary::Stability Coro::Multicore => 1, 5.008009;
 
@@ -76,6 +77,22 @@ EOF
 my $extra = prompt ("Enable extra checks?", $ENV{CORO_MULTICORE_CHECK} ? "y" : "n") =~ /[Yy]/;
 
 my $define = sprintf "-DRECURSION_CHECK=%d", $extra;
+
+# EXPERIMENTAL: if this perl ships the core "offload" hook (perlmulticore.h in
+# CORE/ exposing multicore_register_offload), compile the optional offload
+# backend too. It stays OFF unless Coro::Multicore::enable_offload(1) is
+# called, so this only ever *adds* a dormant, opt-in code path.
+{
+   my $core_h = "$Config{archlibexp}/CORE/perlmulticore.h";
+   if (open my $fh, "<", $core_h) {
+      local $/;
+      my $txt = <$fh>;
+      if ($txt =~ /multicore_register_offload/) {
+         $define .= " -DHAVE_MULTICORE_OFFLOAD";
+         print "Detected core multicore offload hook -> building experimental offload backend (off by default).\n";
+      }
+   }
+}
 
 WriteMakefile(Coro::MakeMaker::coro_args(
     dist	=> {

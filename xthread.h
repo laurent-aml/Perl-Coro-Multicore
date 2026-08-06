@@ -53,6 +53,7 @@ typedef pthread_cond_t xcond_t;
 #define X_COND_INIT                     PTHREAD_COND_INITIALIZER
 #define X_COND_CREATE(cond)		pthread_cond_init (&(cond), 0)
 #define X_COND_SIGNAL(cond)             pthread_cond_signal (&(cond))
+#define X_COND_BROADCAST(cond)          pthread_cond_broadcast (&(cond))
 #define X_COND_WAIT(cond,mutex)         pthread_cond_wait (&(cond), &(mutex))
 #define X_COND_TIMEDWAIT(cond,mutex,to) pthread_cond_timedwait (&(cond), &(mutex), &(to))
 
@@ -132,6 +133,7 @@ typedef pthread_cond_t xcond_t;
 #define X_COND_INIT			PTHREAD_COND_INITIALIZER
 #define X_COND_CREATE(cond)		pthread_cond_init (&(cond), 0)
 #define X_COND_SIGNAL(cond)		pthread_cond_signal (&(cond))
+#define X_COND_BROADCAST(cond)		pthread_cond_broadcast (&(cond))
 #define X_COND_WAIT(cond,mutex)		pthread_cond_wait (&(cond), &(mutex))
 #define X_COND_TIMEDWAIT(cond,mutex,to)	pthread_cond_timedwait (&(cond), &(mutex), &(to))
 

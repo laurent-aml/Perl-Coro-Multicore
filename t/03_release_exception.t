@@ -52,16 +52,15 @@ my $NAP = 0.5;      # how long each released call stays out of the interpreter
 }
 
 # --- a throw aimed at a coro that is inside a released call ----------------
-my (@seen, $call_returned, $eval_err, $yield_err);
+my ($reached_past_call, $eval_err, $yield_err);
 
 my $t0 = Time::HiRes::time ();
 
 my $victim = async {
-   $call_returned = 0;
-   my $ok = eval { Coro::Multicore::sleep $NAP; $call_returned = 1; 1 };
+   my $ok = eval { Coro::Multicore::sleep $NAP; $reached_past_call = 1; 1 };
    $eval_err = $ok ? undef : $@;
 
-   # the coro's next yield point after the released call
+   # it has already been delivered by now, so this must come back clean
    eval { Coro::cede; 1 } or $yield_err = $@;
 };
 
@@ -74,45 +73,30 @@ $victim->join;
 
 my $elapsed = Time::HiRes::time () - $t0;
 
-# The XS call is left alone: it is not interrupted part-way, so whatever C state
-# it owns cannot be torn in half by the exception.
-ok $call_returned, "a throw during a released call does not interrupt the call";
-is $eval_err, undef, "so nothing is raised out of the call itself";
+# The XS function is left to finish its blocking work and clean up; the exception
+# is armed instead to fire at the XSUB's scope exit.  So from perl this reads as
+# "the released call died", while the XS frame really did return normally.
+like $eval_err, qr/boom/, "the exception is raised out of the released call";
+ok !$reached_past_call, "so execution does not continue past the call";
 
-# If the throw had landed before the call was even entered, this would be ~0 and
-# the crossing we care about would never have happened.
+# Had it been delivered before the call was entered, this would be ~0.
 cmp_ok $elapsed, '>=', $NAP * 0.8,
-   "the release boundary really was crossed while the throw was pending";
+   "delivered on reacquiring, i.e. the release boundary really was crossed";
 
-# ...and the exception is not lost: it is delivered at the next yield.
-like $yield_err, qr/boom/, "the pending exception surfaces at the next yield";
+is $yield_err, undef, "nothing is left pending for a later yield";
 
-# --- the gap that is left ---------------------------------------------------
-#
-# Letting the call finish is deliberate (see EXCEPTIONS in Multicore.pm): raising
-# from pmapi_acquire () would unwind out of the middle of an XS function that
-# still has cleanup pending, and the blocking work is finished by then anyway, so
-# nothing would be cancelled - only discarded.
-#
-# What is *not* deliberate is how late delivery then is.  It happens at the coro's
-# next yield, which test 6 above pins down; a thread that returns from the call
-# and then finishes without yielding again may never see the exception at all.
-#
-# The intended fix is to deliver at the first perl-level boundary after the XS
-# function returns - still without unwinding through it, so the cleanup-safety
-# argument is untouched, but promptly rather than whenever a yield happens along.
-# Note what that would look like from perl: an eval around the released call would
-# then catch the exception, because the boundary falls inside it. So it reads like
-# "the call died" to the caller, while the XS frame really did return normally.
-#
-# Hence the assertion below, and hence tests 3 and 4 are the ones that must be
-# revisited if this is implemented - they pin the current, later timing.
-TODO: {
-   local $TODO = "delivery is as late as the next yield; the intended behaviour "
-               . "is the first perl-level boundary after the call returns, which "
-               . "an eval around the call would catch (see BUGS & LIMITATIONS)";
+# Delivery is at the XSUB's scope exit rather than at some later yield, so an
+# exception can no longer be dropped by a coro that returns and then just ends.
+{
+   my $late_err;
+   my $ender = async {
+      eval { Coro::Multicore::sleep $NAP; 1 } or $late_err = $@;
+      # no cede, no block: the coro simply ends here
+   };
+   async { Coro::AnyEvent::sleep $NAP / 5; $ender->throw ("gone\n") };
+   $ender->join;
 
-   ok !$call_returned, "pending exception is delivered promptly after the call";
+   like $late_err, qr/gone/, "not lost when the coro ends without yielding again";
 }
 
 # --- the interpreter is still usable afterwards ----------------------------
