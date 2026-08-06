@@ -241,6 +241,26 @@ the moment, so don't nest them.
 The opposite of C<Coro::Multicore::scope_disable>: instructs Coro::Multicore to
 I<not> handle the next multicore-enabled request.
 
+=item $previous = Coro::Multicore::max_idle [$threads]
+
+Get or set the number of idle worker threads kept warm (default C<1>). The
+release/acquire backend grows its worker pool on demand - one thread per
+blocking call in flight - and, once a burst subsides, lets the excess threads
+retire (see C<idle_timeout>). This is the floor that retirement never drops
+below, so a small pool is always ready to pick up the next release without
+paying thread-creation latency. Returns the previous value.
+
+=item $previous = Coro::Multicore::idle_timeout [$seconds]
+
+Get or set how long, in seconds, a surplus idle worker thread (one above
+C<max_idle>) waits for work before it retires (default C<10>). Set to C<0> to
+disable reaping entirely, keeping every thread the pool ever grew to. Returns
+the previous value.
+
+Together with C<max_idle> this bounds the steady-state worker-thread count after
+a load spike: threads beyond C<max_idle> that stay idle for C<idle_timeout>
+seconds exit, shrinking the pool back down.
+
 =back
 
 =cut

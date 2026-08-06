@@ -1,6 +1,5 @@
 Revision history for Perl extension Coro::Multicore.
 
-TODO: idle timeout, like IO::AIO
 TODO: add examples
 
 1.0701
@@ -17,6 +16,11 @@ TODO: add examples
 	  that call, which is why t/01_basic.t (sleeps of 1 and 2) never showed it.
 	- allow the backend to record its own hook.
           This module is then independent from Coro/AnyEvent.
+	- reap idle release/acquire worker threads, like IO::AIO: the pool
+	  now shrinks back to max_idle threads (default 1) after a load spike,
+	  surplus idle threads retiring after idle_timeout seconds (default 10).
+	  Tunable via Coro::Multicore::max_idle and ::idle_timeout.
+
 1.07  Tue Aug  3 16:12:02 CEST 2021
 	- renew event pipe in an atfork handler, for limited fork support.
 	- document the fact that AnyEvent is no longer initialised automatically.

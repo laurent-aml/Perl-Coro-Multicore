@@ -134,7 +134,8 @@ static xmutex_t release_m = X_MUTEX_INIT;
 static xcond_t release_c = X_COND_INIT;
 static struct tctxs releasers;
 static int idle;
-static int min_idle = 1;
+static int max_idle = 1;      /* idle worker threads to keep warm; excess ones retire */
+static int idle_timeout = 10; /* seconds an excess idle thread waits before retiring (0 = never reap) */
 static int curthreads, max_threads = 1; /* protected by release_m */
 
 static xmutex_t acquire_m = X_MUTEX_INIT;
@@ -154,24 +155,37 @@ X_THREAD_PROC(thread_proc)
 
     for (;;)
       {
-        while (!releasers.cur)
-          if (idle <= min_idle || 1)
-            X_COND_WAIT (release_c, release_m);
-          else
-            {
-              struct timespec ts = { time (0) + idle - min_idle, 0 };
+        int reaping = 0;
 
-              if (X_COND_TIMEDWAIT (release_c, release_m, ts) == ETIMEDOUT)
-                if (idle > min_idle && !releasers.cur)
+        /* wait for a releaser; if we stay idle past idle_timeout while more than
+         * max_idle threads sit idle, retire this one (never dropping the warm
+         * pool below max_idle threads). */
+        while (!releasers.cur)
+          if (idle_timeout && idle > max_idle)
+            {
+              struct timespec ts = { time (0) + idle_timeout, 0 };
+
+              if (X_COND_TIMEDWAIT (release_c, release_m, ts) == ETIMEDOUT
+                  && idle > max_idle && !releasers.cur)
+                {
+                  reaping = 1;
                   break;
+                }
             }
+          else
+            X_COND_WAIT (release_c, release_m);
+
+        if (reaping)
+          {
+            --idle;
+            --curthreads;
+            X_UNLOCK (release_m);
+            break;
+          }
 
         ctx = tctxs_get (&releasers);
         --idle;
         X_UNLOCK (release_m);
-
-        if (!ctx) /* timed out? */
-          break;
 
         pthread_sigmask (SIG_SETMASK, &cursigset, 0);
         JMPENV_PUSH (ctx->jeret);
@@ -248,7 +262,7 @@ pmapi_release (void)
 
   X_LOCK (release_m);
 
-  if (idle <= min_idle)
+  if (idle <= max_idle)
     start_thread ();
 
   tctxs_put (&releasers, ctx);
@@ -337,7 +351,7 @@ BOOT:
 
         if (0) { /*D*/
         X_LOCK (release_m);
-        while (idle < min_idle)
+        while (idle < max_idle)
           start_thread ();
         X_UNLOCK (release_m);
         }
@@ -371,20 +385,27 @@ scoped_disable ()
         CORO_ENTERLEAVE_SCOPE_HOOK (set_thread_enable, (void *)2, set_thread_enable, (void *)0);
         ENTER; /* see Guard.xs */
 
-#if 0
-
 U32
-min_idle_threads (U32 min = NO_INIT)
+max_idle (U32 n = NO_INIT)
 	CODE:
-        X_LOCK (acquire_m);
-        RETVAL = min_idle;
+        X_LOCK (release_m);
+        RETVAL = max_idle;
         if (items)
-	  min_idle = min;
-        X_UNLOCK (acquire_m);
+          max_idle = n;
+        X_UNLOCK (release_m);
         OUTPUT:
         RETVAL
 
-#endif
+U32
+idle_timeout (U32 seconds = NO_INIT)
+	CODE:
+        X_LOCK (release_m);
+        RETVAL = idle_timeout;
+        if (items)
+          idle_timeout = seconds;
+        X_UNLOCK (release_m);
+        OUTPUT:
+        RETVAL
 
 int
 fd ()
