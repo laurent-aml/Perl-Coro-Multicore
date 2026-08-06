@@ -3,6 +3,9 @@ Revision history for Perl extension Coro::Multicore.
 TODO: idle timeout, like IO::AIO
 TODO: add examples
 
+1.0701
+	- allow the backend to record its own hook.
+          This module is then independent from Coro/AnyEvent.
 1.07  Tue Aug  3 16:12:02 CEST 2021
 	- renew event pipe in an atfork handler, for limited fork support.
 	- document the fact that AnyEvent is no longer initialised automatically.
