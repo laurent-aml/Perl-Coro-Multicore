@@ -58,7 +58,15 @@ static void *perl_thx;
 static sigset_t cursigset, fullsigset;
 
 static int global_enable = 0;
-static int thread_enable; /* 0 undefined, 1 disabled, 2 enabled */
+
+/* per-coro override of global_enable, set by scoped_enable/scoped_disable:
+ *   0 = unset, defer to global_enable
+ *   1 = enabled  (scoped_enable)
+ *   2 = disabled (scoped_disable)
+ * Two things are encoded at once, which is why the test below reads
+ * "(thread_enable ? thread_enable : global_enable) & 1": nonzero means "set, so
+ * do not fall back", while bit 0 carries the on/off answer itself. */
+static int thread_enable;
 
 /* assigned to a thread for each release/acquire */
 struct tctx
