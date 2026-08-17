@@ -240,6 +240,26 @@ start_thread (void)
 static void
 pmapi_release (void)
 {
+  /* Releasing the interpreter hands it to another native thread, which runs
+   * other coro threads - exactly what an atomic {} section forbids. So while the
+   * running coro is atomic, suppress multicore entirely and let the XS function
+   * run inline on this thread. This deliberately overrides both scoped_enable
+   * and the global enable: atomicity is a correctness guarantee, whereas
+   * multicore is an optimisation, and perlmulticore is specified so that a
+   * release that does nothing is always valid.
+   *
+   * Without this the call dies rather than merely breaking atomicity: the worker
+   * thread's CORO_SCHEDULE hits the same atomic check, and the exception comes
+   * back through the transfer's JMPENV to be rethrown at pmapi_acquire ().
+   *
+   * Clearing current_key is what makes the matching pmapi_acquire () a no-op,
+   * so the pairing stays correct even if the atomic count changes in between. */
+  if (CORO_ATOMIC)
+    {
+      X_TLS_SET (current_key, 0);
+      return;
+    }
+
   if (! ((thread_enable ? thread_enable : global_enable) & 1))
     {
       X_TLS_SET (current_key, 0);

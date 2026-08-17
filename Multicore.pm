@@ -241,6 +241,32 @@ the moment, so don't nest them.
 The opposite of C<Coro::Multicore::scope_disable>: instructs Coro::Multicore to
 I<not> handle the next multicore-enabled request.
 
+=item Coro::Atomic as a stronger scoped_disable
+
+A L<Coro::Atomic> section - C<atomic { ... }>, C<scoped_atomic>, or a
+C<:Atomic> sub - also switches this module off for its duration, and is the
+stronger of the two ways to do it.  Where C<scoped_disable> only asks this module
+to leave the interpreter alone, an atomic section additionally forbids the
+running coro thread to yield at all, so nothing else can interleave by any route
+- an explicit C<cede>, a blocking C<< Coro::Semaphore->down >>, or a condvar wait
+inside the region are fatal errors rather than silent switches.
+
+Use C<scoped_disable> when you only want the work to stay on this thread, and an
+atomic section when the region must actually run as one indivisible step.  The
+latter also nests, which C<scoped_disable> does not.
+
+Note that C<scoped_enable> does B<not> do what it says inside an atomic section.
+The suppression is unconditional and deliberately wins over C<enable>,
+C<scoped_enable> and C<scoped_disable> alike.  A C<scoped_enable> written inside
+the region therefore has no effect at all: not within it, because the section
+wins, and not after it either, since its own scope normally ends with the region
+it was written in.  (One already in effect from an enclosing scope simply resumes
+once the section ends.)  This is not an error - the call is simply inert, so do
+not reach for it expecting to carve a parallel hole out of an atomic region.
+
+See L</INTERACTION WITH OTHER SOFTWARE> for why, and for what becomes of the
+multicore-enabled calls themselves.
+
 =item $previous = Coro::Multicore::max_idle [$threads]
 
 Get or set the number of idle worker threads kept warm (default C<1>). The
@@ -404,6 +430,42 @@ to keep safe perl signals safe.
 This module moves the same perl interpreter between different
 threads. Some modules might get confused by that (although this can
 usually be considered a bug). This is a rare case though.
+
+=item atomic sections (L<Coro::Atomic>)
+
+An C<atomic> section guarantees that no other coro thread runs until it
+finishes.  Both of this module's backends would break that guarantee - the
+default one releases the interpreter to another native thread, which then runs
+other coro threads, and the I<offload> backend suspends the calling coro
+outright.
+
+So for as long as the running coro is inside an atomic section, this module is
+suppressed: multicore-enabled XS functions still work, they simply run inline on
+the current thread, as they would with this module not loaded at all.  This
+overrides C<enable>, C<scoped_enable> and C<scoped_disable> alike - atomicity is
+a correctness guarantee, whereas multicore is an optimisation, and the
+perlmulticore specification makes a release that does nothing always valid.
+
+That also makes an atomic section usable as a deliberate off-switch for this
+module, a stronger one than C<scoped_disable>, and correspondingly makes any
+C<scoped_enable> inside it inert - see
+L</Coro::Atomic as a stronger scoped_disable> in L</API FUNCTIONS>.
+
+Two consequences worth knowing:
+
+Such calls become possible rather than merely safe.  Without this suppression
+B<both> backends die: the offload backend suspends the caller and trips Coro's
+yield check directly, and the release/acquire backend trips it just as surely on
+the worker thread - the C<CORO_SCHEDULE> there goes through the same check, and
+the exception is carried back through the transfer's C<JMPENV> and rethrown at
+the C<perlinterp_acquire ()>.  So without it a C<Digest::MD5::md5> inside an
+atomic section would be a fatal error; with it, the same digest is computed,
+simply without releasing the interpreter.  Nothing is lost but parallelism.
+
+An atomic section can delay other threads' C<perlinterp_acquire ()>.  A coro that
+released the interpreter earlier cannot reacquire it until the atomic section
+ends, because reacquiring needs the interpreter and the atomic coro will not
+yield.  Keep atomic sections short, as you would anyway.
 
 =item event loop reliance
 
