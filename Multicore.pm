@@ -374,17 +374,37 @@ went wrong, if things go wrong.
 
 =item EXCEPTIONS
 
-When a thread that has currently released the perl interpreter (e.g.
-because it is executing a perlmulticore enabled XS function) receives an exception, it will
-at first continue normally.
+When a thread that has currently released the perl interpreter (e.g. because it is
+executing a perlmulticore enabled XS function) receives an exception, it continues
+normally: the XS function is B<not> interrupted, C<perlinterp_acquire ()> returns
+as usual, and the call completes and returns its value.  The exception is not lost -
+it is held pending on that coro thread and delivered by L<Coro> in the ordinary
+way, at that thread's next yield point.
 
-After acquiring the perl interpreter again, it will throw the
-exception it previously received. More specifically, when a thread
-calls C<perlinterp_acquire ()> and has received an exception, then
-C<perlinterp_acquire ()> will not return but instead C<die>.
+This is deliberate.  By the time C<perlinterp_acquire ()> is reached the blocking
+work has already finished, so raising there would not cancel anything; it would
+only discard a result that already exists, and would do so by unwinding out of the
+middle of an XS function that still has cleanup pending - a buffer to free, a
+statement to finalise, a mutex to unlock.  The perlmulticore contract every
+supporting module is written against is C<release (); work (); acquire ();> and
+then I<carry on>, and such modules do not install unwind-safe cleanup around their
+acquire.  Letting the call finish keeps that contract, and the exception then
+unwinds at the perl level where C<eval>, guards and destructors all behave as
+written.
 
-Most code that has been updated for perlmulticore support will not expect
-this, and might leave internal state corrupted to some extent.
+The cost is that delivery is as late as the thread's next yield.  A thread that
+returns from the call and then finishes without yielding again may not see the
+exception at all.  Making delivery prompt - at the first perl-level boundary after
+the XS function returns, still without unwinding through it - would remove that
+gap while keeping the safety, and is the intended direction; see L</BUGS &
+LIMITATIONS>.
+
+If what you want is to B<abort> the work rather than to be told about it
+afterwards, note that neither delivery point can do that: once the C code is
+running, release/acquire has no way to interrupt it.  That requires cooperation
+from the module itself, and the I<offload> backend is where it can be expressed -
+its job record is a natural place for a cancellation flag that a chunked C<work>
+can poll.
 
 =item CANCELLATION
 
@@ -486,6 +506,26 @@ Future versions of this module might do this automatically.
 =head1 BUGS & LIMITATIONS
 
 =over 4
+
+=item exception delivery is as late as the next yield
+
+An exception thrown at a coro thread while it has the interpreter released is
+held pending and delivered at that thread's next yield point, rather than at the
+first perl-level boundary after the XS call returns (see L</EXCEPTIONS>).  So
+delivery can be arbitrarily late, and a thread that returns from the call and then
+finishes without yielding again may never see it.
+
+Delivering at the next perl-level boundary instead would close both gaps while
+still letting the XS function return and clean up normally.  That is the intended
+direction; it is not implemented.
+
+=item cancellation cannot abort work already running
+
+Neither backend can interrupt C code that is already executing - see
+L</CANCELLATION> for what unsafe cancellation does instead.  Aborting work needs
+the module's cooperation, and only the I<offload> backend has anywhere to put it:
+a cancellation flag in the job record that a chunked C<work> polls between
+chunks.  Not implemented.
 
 =item (OS-) threads are never released
 

@@ -3,6 +3,12 @@ Revision history for Perl extension Coro::Multicore.
 TODO: add examples
 
 1.0701
+	- release/acquire: an exception aimed at a thread while it has the interpreter
+	  released is now raised as the XS function returns, instead of waiting for
+	  that thread's next Schedule-Like Function.  The XS function still runs to its
+	  end and cleans up - nothing unwinds through it - but an eval around the call
+	  now catches the exception, and it can no longer be lost by a thread that
+	  returns from the call and then ends without ceding.
 	- Windows: the event pipe could not be initialised.  schmorp.h's s_fd_blocking
 	  passes S_TO_HANDLE (fd) to ioctlsocket, which perl remaps to
 	  win32_ioctlsocket - and that translates the perl fd itself, so the
