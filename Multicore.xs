@@ -412,10 +412,16 @@ sleep (NV seconds)
 	CODE:
         perlinterp_release ();
 	{
-          int nsec = seconds;
-          if (nsec) sleep (nsec);
-          nsec = (seconds - nsec) * 1e9;
-          if (nsec) usleep (nsec);
+          int sec  = seconds > 0 ? (int)seconds : 0;
+          int usec;
+
+          if (sec) sleep (sec);
+
+          /* usleep () takes MICROseconds - POSIX only defines it for values
+           * below one second, which holds here by construction since the whole
+           * seconds have just been slept off above. */
+          usec = (seconds - sec) * 1e6;
+          if (usec > 0) usleep (usec);
         }
         perlinterp_acquire ();
 

@@ -4,6 +4,10 @@ TODO: idle timeout, like IO::AIO
 TODO: add examples
 
 1.0701
+	- sleep overshot fractional sleeps 1000x: the sub-second remainder was computed
+	  in nanoseconds and handed to usleep, which takes microseconds, so sleep 0.4
+	  slept for 400 seconds.  Integer sleeps have a zero remainder and never reach
+	  that call, which is why t/01_basic.t (sleeps of 1 and 2) never showed it.
 	- allow the backend to record its own hook.
           This module is then independent from Coro/AnyEvent.
 1.07  Tue Aug  3 16:12:02 CEST 2021
