@@ -422,7 +422,7 @@ in the parent, then it is safe to start using it in a forked child.
  Marc Lehmann <schmorp@schmorp.de>
  http://software.schmorp.de/pkg/AnyEvent-XSThreadPool.html
 
-Additional thanks to Zsbán Ambrus, who gave considerable desing input for
+Additional thanks to Zsbán Ambrus, who gave considerable design input for
 this module and the perl multicore specification.
 
 =cut
