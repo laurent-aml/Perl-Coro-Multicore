@@ -228,6 +228,16 @@ reflect whether multicore functionality is enabled for the current thread.
 
 The function returns the previous value of the enable flag.
 
+Enabling it does not by itself guarantee that anything is released. Releasing
+the interpreter means parking this thread's machine context and letting another
+thread resume it, and not every L<Coro> backend permits that: a Windows fiber may
+only be switched to by the thread that last ran it. When Coro was built with such
+a backend this module says so once, at load time, and runs the bracket inline
+instead - correct, just not parallel. Rebuild Coro with C<CORO_INTERFACE=a> (the
+handcoded assembler backend, which is the default on Windows x86/x86_64 built with
+MinGW) to get the real thing. The I<offload> backend is unaffected either way,
+since it never moves the interpreter.
+
 =item Coro::Multicore::scoped_enable
 
 This function instructs Coro::Multicore to handle all requests executed

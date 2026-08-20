@@ -237,6 +237,11 @@ start_thread (void)
   xthread_create (&tid, thread_proc, 0);
 }
 
+/* Whether Coro's libcoro backend can have a parked context resumed by a thread
+ * other than the one that parked it.  Decided once at BOOT from Coro's own
+ * report; assume it can, so that an unrecognised backend behaves as before. */
+static int backend_migrates = 1;
+
 static void
 pmapi_release (void)
 {
@@ -255,6 +260,16 @@ pmapi_release (void)
    * Clearing current_key is what makes the matching pmapi_acquire () a no-op,
    * so the pairing stays correct even if the atomic count changes in between. */
   if (CORO_ATOMIC)
+    {
+      X_TLS_SET (current_key, 0);
+      return;
+    }
+
+  /* Same treatment for a backend whose context only its own thread may resume
+   * (see BOOT).  There the release is not merely pointless but undefined, so it
+   * has to be refused rather than attempted - and refusing is always valid, since
+   * perlmulticore specifies a release that does nothing as legal. */
+  if (!backend_migrates)
     {
       X_TLS_SET (current_key, 0);
       return;
@@ -369,6 +384,52 @@ BOOT:
 
 	I_CORO_API ("Coro::Multicore");
 
+        /* Which libcoro backend Coro was built with decides whether releasing the
+         * interpreter is possible at all.  The bracket parks the calling thread's
+         * machine context and lets another thread resume it; a Windows fiber
+         * forbids exactly that - only the thread that last ran a fiber may switch
+         * to it - so handing one to a worker is undefined behaviour rather than
+         * merely slow.  Ask Coro (an undocumented constant, but the only report
+         * there is), and if the answer is a backend like that, run the bracket
+         * inline instead and say so once: silently declining to parallelise is
+         * kinder than corrupting, but neither is worth being quiet about.
+         *
+         * The offload backend is unaffected and stays available - it never moves
+         * the interpreter, which is the whole point of it. */
+        {
+          dSP;
+
+          ENTER;
+          SAVETMPS;
+          PUSHMARK (SP);
+          PUTBACK;
+
+          if (call_pv ("Coro::State::BACKEND", G_SCALAR | G_EVAL) == 1)
+            {
+              SV *sv;
+
+              SPAGAIN;
+              sv = POPs;
+              PUTBACK;
+
+              if (!SvTRUE (ERRSV) && SvOK (sv))
+                {
+                  const char *b = SvPV_nolen (sv);
+
+                  backend_migrates = !(strEQ (b, "fiber") || strEQ (b, "loser"));
+
+                  if (!backend_migrates)
+                    warn ("Coro::Multicore: Coro's \"%s\" backend cannot resume a "
+                          "parked context on another thread, so release/acquire "
+                          "will run inline - rebuild Coro with CORO_INTERFACE=a "
+                          "for real multicore (offload is unaffected)", b);
+                }
+            }
+
+          FREETMPS;
+          LEAVE;
+        }
+
         if (0) { /*D*/
         X_LOCK (release_m);
         while (idle < max_idle)
@@ -381,6 +442,14 @@ BOOT:
         perl_multicore_api->pmapi_release = pmapi_release;
         perl_multicore_api->pmapi_acquire = pmapi_acquire;
 }
+
+# Test-only: what BOOT decided about Coro's backend (see t/04_backend.t).
+bool
+_backend_migrates ()
+	CODE:
+        RETVAL = backend_migrates;
+	OUTPUT:
+        RETVAL
 
 bool
 enable (bool enable = NO_INIT)

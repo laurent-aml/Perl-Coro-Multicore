@@ -3,6 +3,8 @@ Revision history for Perl extension Coro::Multicore.
 TODO: add examples
 
 1.0701
+	- release/acquire is refused, rather than attempted, when Coro's backend cannot
+	  have a parked context resumed by another thread.
 	- release/acquire: an exception aimed at a thread while it has the interpreter
 	  released is now raised as the XS function returns, instead of waiting for
 	  that thread's next Schedule-Like Function.  The XS function still runs to its
