@@ -1,3 +1,5 @@
+=encoding utf8
+
 =head1 NAME
 
 Coro::Multicore - make coro threads on multiple cores with specially supported modules
