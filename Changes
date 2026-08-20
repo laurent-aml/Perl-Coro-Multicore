@@ -4,6 +4,13 @@ TODO: idle timeout, like IO::AIO
 TODO: add examples
 
 1.0701
+	- Windows: the event pipe could not be initialised.  schmorp.h's s_fd_blocking
+	  passes S_TO_HANDLE (fd) to ioctlsocket, which perl remaps to
+	  win32_ioctlsocket - and that translates the perl fd itself, so the
+	  descriptor was translated twice and the call failed with ENOTSOCK.  Of the
+	  four consumers of those descriptors only s_epipe_signal's raw WriteFile wants
+	  the underlying handle; recv, ioctlsocket and the event loop all want the perl
+	  fd.
 	- sleep overshot fractional sleeps 1000x: the sub-second remainder was computed
 	  in nanoseconds and handed to usleep, which takes microseconds, so sleep 0.4
 	  slept for 400 seconds.  Integer sleeps have a zero remainder and never reach

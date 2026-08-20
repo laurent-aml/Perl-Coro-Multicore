@@ -336,7 +336,11 @@ s_fd_blocking (int fd, int blocking)
 {
   u_long nonblocking = !blocking;
 
-  return ioctlsocket ((SOCKET)S_TO_HANDLE (fd), FIONBIO, &nonblocking);
+  /* perl remaps ioctlsocket to win32_ioctlsocket, which translates the perl
+   * fd to a SOCKET itself; handing it S_TO_HANDLE (fd) - already the real
+   * handle - makes it translate twice and fail with ENOTSOCK.  S_TO_HANDLE
+   * stays correct for the raw WriteFile in s_epipe_signal below. */
+  return ioctlsocket ((SOCKET)fd, FIONBIO, &nonblocking);
 }
 
 #define s_fd_prepare(fd) s_fd_blocking (fd, 0)
