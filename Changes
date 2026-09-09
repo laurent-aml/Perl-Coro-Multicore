@@ -2,7 +2,14 @@ Revision history for Perl extension Coro::Multicore.
 
 TODO: add examples
 
-1.0701
+1.0702  Web Sep  9 15:09:31 EDT 2026
+	- an atomic {} section suppresses multicore for its duration, when built
+	  against Coro 6.5701 or later (CoroAPI revision 4, which publishes the atomic
+	  depth).  Against an older Coro the module builds and runs without that
+	  protection instead of failing to compile; Makefile.PL says which, and
+	  Coro::Multicore::has_atomic_support reports it at run time.
+
+1.0701  Mon Aug 24 16:37:19 EDT 2026
 	- EXPERIMENTAL, off by default: an optional "offload" backend for the core
 	  multicore_offload hook (Coro::Multicore::enable_offload).  Where the default
 	  release/acquire backend migrates the interpreter to a worker thread while the
