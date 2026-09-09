@@ -15,6 +15,32 @@
 #define X_STACKSIZE 1024 * sizeof (void *)
 
 #include "CoroAPI.h"
+
+/* CORO_ATOMIC (GCoroAPI->atomic_count) arrived with CoroAPI revision 4, which
+ * is Coro 6.5701.  It is what lets the release and offload paths notice that the
+ * running coro is inside an atomic {} section and run the call inline instead of
+ * breaking the section.
+ *
+ * Against an older CoroAPI.h there is no such accessor, so the checks compile
+ * away and the module behaves as it did before the accessor existed: a
+ * multicore-enabled XS call inside an atomic section breaks the section, which
+ * for the release backend surfaces as an exception rather than as silently lost
+ * atomicity.  That is a functional regression, not a memory-safety one, so it is
+ * worth degrading for rather than refusing to build - but it is reported, by
+ * Makefile.PL at build time and by has_atomic_support () at run time.
+ *
+ * The gate is the header's revision rather than the Coro version because the
+ * header is what decides whether this compiles, and it need not come from the
+ * Coro that will be loaded: Coro::MakeMaker picks the first CoroAPI.h along
+ * $Config{sitearch} and @INC.  (I_CORO_API () catches the other direction - a
+ * runtime Coro older than the header this was built against.) */
+#if defined(CORO_API_REVISION) && CORO_API_REVISION >= 4
+# define HAVE_CORO_ATOMIC 1
+#else
+# define HAVE_CORO_ATOMIC 0
+# define CORO_ATOMIC 0   /* no accessor: assume never atomic, as before rev 4 */
+#endif
+
 #include "perlmulticore.h"
 #include "schmorp.h"
 #include "xthread.h"
@@ -1781,6 +1807,16 @@ bool
 _offload_supported ()
 	CODE:
         RETVAL = OFFLOAD_SUPPORTED;
+        OUTPUT:
+        RETVAL
+
+ # Whether this build can see Coro's atomic depth, and so whether an atomic {}
+ # section suppresses multicore for its duration.  False when built against a
+ # CoroAPI.h older than revision 4 (Coro 6.5701).
+bool
+has_atomic_support ()
+	CODE:
+        RETVAL = HAVE_CORO_ATOMIC;
         OUTPUT:
         RETVAL
 

@@ -94,6 +94,100 @@ my $define = sprintf "-DRECURSION_CHECK=%d", $extra;
    }
 }
 
+# CoroAPI revision 4 (Coro 6.5701) publishes the atomic depth, which is what
+# lets an atomic {} section suppress multicore for its duration.  Without it the
+# module still builds and works, minus that protection - see the note in
+# Multicore.xs and has_atomic_support ().
+#
+# Find CoroApi.h following @INC path, to be consistent with the loaded Coro.pm.
+{
+   my $want     = 4;
+   my $want_ver = 6.5701;   # the Coro that ships revision $want
+
+   my $rev_of = sub {
+      my ($dir) = @_;
+      defined $dir or return;
+      open my $fh, "<", "$dir/Coro/CoroAPI.h" or return;
+      local $/;
+      my $txt = <$fh>;
+      $txt =~ /^\s*#\s*define\s+CORO_API_REVISION\s+(\d+)/m ? $1 : 0
+   };
+
+   # The Coro that will be LOADED: the first Coro.pm along @INC.  Read rather
+   # than required, so a Coro that cannot bootstrap here (wrong perl, half-built
+   # tree) does not take the build down with it.
+   my ($coro_pm, $coro_ver);
+   for my $d (@INC) {
+      next unless -e "$d/Coro.pm";
+      $coro_pm = "$d/Coro.pm";
+      if (open my $fh, "<", $coro_pm) {
+         while (<$fh>) {
+            $coro_ver = $1, last if /^\s*our\s+\$VERSION\s*=\s*([\d._]+)\s*;/;
+         }
+      }
+      last;
+   }
+
+   # The header that will be COMPILED against.
+   my $hdr_dir = $Coro::MakeMaker::installsitearch;
+   my $rev     = $rev_of->($hdr_dir);
+
+   defined $rev
+      or die "Cannot find Coro/CoroAPI.h - is Coro installed?\n";
+
+   if (defined $coro_ver) {
+      my $newer_module = $coro_ver >= $want_ver;
+      my $newer_header = $rev >= $want;
+
+      if ($newer_module != $newer_header) {
+         my ($a, $b) = $newer_module
+            ? ("Coro $coro_ver, which ships CoroAPI revision $want",
+               "a CoroAPI.h that declares revision $rev")
+            : ("Coro $coro_ver, which predates CoroAPI revision $want",
+               "a CoroAPI.h that declares revision $rev");
+
+         die <<EOF;
+
+***
+*** Inconsistent Coro - stopping rather than building something that would not
+*** load.
+***
+*** The module that would be loaded and the header that would be compiled against
+*** do not belong together:
+***   loads    $coro_pm  ($a)
+***   compiles $hdr_dir/Coro/CoroAPI.h  ($b)
+***
+*** perl loads the first Coro.pm along \@INC, while Coro::MakeMaker takes the
+*** first CoroAPI.h along \$Config{sitearch} and then \@INC - so an older Coro
+*** installed in sitearch can supply the header for a newer one in PERL5LIB.
+*** I_CORO_API () refuses such a mismatch at load time.
+***
+*** Point both at the same Coro: put its directory first in PERL5LIB, or remove
+*** the one that does not belong to this build.
+***
+EOF
+      }
+   }
+
+   if ($rev >= $want) {
+      print "Using CoroAPI.h revision $rev from $hdr_dir: atomic {} sections will suppress multicore.\n";
+   } else {
+      warn <<EOF;
+
+***
+*** The Coro being built against is older than $want_ver:
+***   $hdr_dir/Coro/CoroAPI.h declares CoroAPI revision $rev.
+***
+*** Building anyway, WITHOUT atomic-section support: a multicore-enabled XS call
+*** inside a Coro::Atomic section will break the section instead of running
+*** inline for its duration.  Coro::Multicore::has_atomic_support() will be false.
+***
+*** To get it, build against Coro $want_ver or later.
+***
+EOF
+   }
+}
+
 WriteMakefile(Coro::MakeMaker::coro_args(
     dist	=> {
 	            PREOP	=> 'pod2text Multicore.pm | tee README >$(DISTVNAME)/README; chmod -R u=rwX,go=rX . ;',

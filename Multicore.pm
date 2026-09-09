@@ -277,6 +277,23 @@ not reach for it expecting to carve a parallel hole out of an atomic region.
 See L</INTERACTION WITH OTHER SOFTWARE> for why, and for what becomes of the
 multicore-enabled calls themselves.
 
+=item $bool = Coro::Multicore::has_atomic_support
+
+Whether this build can see Coro's atomic depth, and so whether a
+L<Coro::Atomic> section suppresses multicore for its duration - a
+multicore-enabled XS call inside one then still runs and returns the same
+result, just inline on the current thread.
+
+True when built against Coro 6.5701 or later (CoroAPI revision 4, which added
+the C<atomic_count> accessor).  Against an older Coro the module builds and works
+without it, and such a call inside an atomic section breaks the section instead:
+with the release backend that surfaces as an exception, not as silently lost
+atomicity.  C<Makefile.PL> says which build you are getting.
+
+Note the Coro I<version> alone does not settle it, since the accessor was added
+to a 6.57: what matters is the C<CoroAPI.h> the module was compiled against, and
+Coro::MakeMaker takes the first one along C<$Config{sitearch}> and C<@INC>.
+
 =item $previous = Coro::Multicore::enable_offload [$enable]
 
 Install (C<$enable> true, the default) or remove (false) the I<offload> backend
